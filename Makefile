@@ -4,7 +4,7 @@ docker-build:
 docker-run:
 	cargo build --manifest-path=tea/Cargo.toml && \
 		docker run --name maelstrom --rm -v ./tea/target/:/builds/ -v ./debug-logs:/store/ maelstrom-container \
-		test -w echo --bin /builds/debug/echo --node-count 1 --time-limit 10
+		test -w unique-ids --bin /builds/debug/generate --time-limit 30 --rate 1000 --node-count 3 --availability total --nemesis partition
 
 docker-stop: 
 	docker stop maelstrom

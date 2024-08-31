@@ -1,2 +1,2 @@
 [workspace]
-members = ["echo"]
+members = ["echo","generate"]
