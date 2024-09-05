@@ -118,3 +118,80 @@ Everything looks good! ?(??`)?
 ```
 
 Sweet!
+
+## Challenge 3B
+
+<blockquote>
+
+Your node should propagate values it sees from broadcast messages to the other nodes in the cluster. It can use the topology passed to your node in the topology message or you can build your own topology.
+
+The simplest approach is to simply send a node’s entire data set on every message, however, this is not practical in a real-world system. Instead, try to send data more efficiently as if you were building a real broadcast system.
+
+Values should propagate to all other nodes within a few seconds.
+
+</blockquote>
+
+Easy enough, let's introduce a new type of message - `Gossip`
+
+When a node receives a new ID it fires of a `Gossip` message to all its neighbours.
+
+
+```rust
+    // Read each line asynchronously
+    while let Some(msg) = comms_client.msg_channel.recv().await {
+        match msg.body {
+            MessageBody::Gossip { message, .. } => {
+                if messages.insert(message) {
+                    for neighbour in topology.get(&my_id).unwrap().iter() {
+                        let gossip = Message {
+                            dest: neighbour.to_string(),
+                            src: my_id.clone(),
+                            body: MessageBody::Gossip { message },
+                        };
+                        let _ = comms_client.response_channel.send(gossip).await;
+                    }
+                }
+            }
+            MessageBody::Broadcast { msg_id, message } => {
+                if messages.insert(message) {
+                    for neighbour in topology.get(&my_id).unwrap().iter() {
+                        let gossip = Message {
+                            dest: neighbour.to_string(),
+                            src: my_id.clone(),
+                            body: MessageBody::Gossip { message },
+                        };
+                        let _ = comms_client.response_channel.send(gossip).await;
+                    }
+                }
+                let resp = Message {
+                    dest: msg.src,
+                    src: my_id.clone(),
+                    body: MessageBody::BroadcastOk {
+                        in_reply_to: msg_id,
+                    },
+                };
+                let _ = comms_client.response_channel.send(resp).await;
+            }
+            MessageBody::Read { msg_id } => {
+                let resp = Message {
+                    dest: msg.src,
+                    src: my_id.clone(),
+                    body: MessageBody::ReadOk {
+                        in_reply_to: msg_id,
+                        messages: messages.clone(),
+                    },
+                };
+                let _ = comms_client.response_channel.send(resp).await;
+            }
+            _ => panic!("Unknown message type"),
+        }
+    }
+
+```
+
+That seems to do it!
+
+
+```terminal
+Everything looks good! ?(??`)?
+```

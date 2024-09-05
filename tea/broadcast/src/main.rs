@@ -63,8 +63,29 @@ async fn main() {
     // Read each line asynchronously
     while let Some(msg) = comms_client.msg_channel.recv().await {
         match msg.body {
+            MessageBody::Gossip { message, .. } => {
+                if messages.insert(message) {
+                    for neighbour in topology.get(&my_id).unwrap().iter() {
+                        let gossip = Message {
+                            dest: neighbour.to_string(),
+                            src: my_id.clone(),
+                            body: MessageBody::Gossip { message },
+                        };
+                        let _ = comms_client.response_channel.send(gossip).await;
+                    }
+                }
+            }
             MessageBody::Broadcast { msg_id, message } => {
-                messages.insert(message);
+                if messages.insert(message) {
+                    for neighbour in topology.get(&my_id).unwrap().iter() {
+                        let gossip = Message {
+                            dest: neighbour.to_string(),
+                            src: my_id.clone(),
+                            body: MessageBody::Gossip { message },
+                        };
+                        let _ = comms_client.response_channel.send(gossip).await;
+                    }
+                }
                 let resp = Message {
                     dest: msg.src,
                     src: my_id.clone(),
@@ -167,6 +188,9 @@ enum MessageBody {
     ReadOk {
         in_reply_to: u32,
         messages: HashSet<u32>,
+    },
+    Gossip {
+        message: u32,
     },
     Broadcast {
         msg_id: u32,
