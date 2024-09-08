@@ -1,9 +1,58 @@
+use std::collections::hash_set::Difference;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json;
 use tokio::io::{self, AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::mpsc;
+use tokio::time;
+
+struct Gossipper {
+    values: Vec<u32>,
+    set: HashSet<u32>,
+}
+
+impl Gossipper {
+    fn new() -> Self {
+        Gossipper {
+            values: Vec::new(),
+            set: HashSet::new(),
+        }
+    }
+
+    fn add(&mut self, v: u32) {
+        if self.set.insert(v) {
+            self.values.push(v);
+        }
+    }
+
+    fn add_list(&mut self, l: Vec<u32>) {
+        for v in l {
+            self.add(v);
+        }
+    }
+
+    fn get_seq_id(&self) -> usize {
+        self.values.len()
+    }
+
+    fn get_gossip(&self, start_seq_id: usize) -> Vec<u32> {
+        self.values[start_seq_id..].to_vec()
+    }
+}
+
+mod test {
+    use crate::Gossipper;
+
+    #[test]
+    fn test_gossiper() {
+        let mut g = Gossipper::new();
+        g.add(1);
+        assert_eq!(g.get_gossip(g.get_seq_id()), Vec::<u32>::new());
+        assert_eq!(g.get_gossip(0), vec![1]);
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -58,55 +107,88 @@ async fn main() {
         _ => panic!("init message expected"),
     }
 
-    let mut messages = HashSet::new();
+    let mut neighbour_seq_ids_seen = HashMap::new();
+    let mut seq_ids_neighbour_seen = HashMap::new();
 
-    // Read each line asynchronously
-    while let Some(msg) = comms_client.msg_channel.recv().await {
-        match msg.body {
-            MessageBody::Gossip { message, .. } => {
-                if messages.insert(message) {
-                    for neighbour in topology.get(&my_id).unwrap().iter() {
+    for neighbour in topology.get(&my_id).unwrap().iter() {
+        neighbour_seq_ids_seen.insert(neighbour, 0);
+        seq_ids_neighbour_seen.insert(neighbour, 0);
+        for neighbour_of_neighbour in topology.get(neighbour).unwrap().iter() {
+            if *neighbour_of_neighbour == my_id {
+                continue;
+            }
+
+            neighbour_seq_ids_seen.insert(neighbour_of_neighbour, 0);
+            seq_ids_neighbour_seen.insert(neighbour_of_neighbour, 0);
+            for n3 in topology.get(neighbour_of_neighbour).unwrap().iter() {
+                if *n3 == my_id {
+                    continue;
+                }
+                neighbour_seq_ids_seen.insert(n3, 0);
+                seq_ids_neighbour_seen.insert(n3, 0);
+            }
+        }
+    }
+
+    let mut gossiper = Gossipper::new();
+
+    let mut interval = time::interval(Duration::from_millis(200));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let curr_seq_id = gossiper.get_seq_id();
+                for (neighbour, seq_id_seen) in seq_ids_neighbour_seen.iter() {
+                    if *seq_id_seen < curr_seq_id {
                         let gossip = Message {
                             dest: neighbour.to_string(),
                             src: my_id.clone(),
-                            body: MessageBody::Gossip { message },
+                            body: MessageBody::Gossip {
+                                node_seq_id: curr_seq_id,
+                                last_neighbour_seq_id: *neighbour_seq_ids_seen
+                                    .get(neighbour)
+                                    .unwrap(),
+                                messages: gossiper.get_gossip(*seq_id_seen),
+                            },
                         };
                         let _ = comms_client.response_channel.send(gossip).await;
                     }
                 }
-            }
-            MessageBody::Broadcast { msg_id, message } => {
-                if messages.insert(message) {
-                    for neighbour in topology.get(&my_id).unwrap().iter() {
-                        let gossip = Message {
-                            dest: neighbour.to_string(),
-                            src: my_id.clone(),
-                            body: MessageBody::Gossip { message },
-                        };
-                        let _ = comms_client.response_channel.send(gossip).await;
-                    }
+            },
+            Some(msg) = comms_client.msg_channel.recv() => match msg.body {
+                MessageBody::Gossip {
+                    messages,
+                    node_seq_id,
+                    last_neighbour_seq_id,
+                } => {
+                    *neighbour_seq_ids_seen.get_mut(&msg.src).unwrap() = node_seq_id;
+                    *seq_ids_neighbour_seen.get_mut(&msg.src).unwrap() = last_neighbour_seq_id;
+                    gossiper.add_list(messages);
                 }
-                let resp = Message {
-                    dest: msg.src,
-                    src: my_id.clone(),
-                    body: MessageBody::BroadcastOk {
-                        in_reply_to: msg_id,
-                    },
-                };
-                let _ = comms_client.response_channel.send(resp).await;
+                MessageBody::Broadcast { msg_id, message } => {
+                    gossiper.add(message);
+                    let resp = Message {
+                        dest: msg.src,
+                        src: my_id.clone(),
+                        body: MessageBody::BroadcastOk {
+                            in_reply_to: msg_id,
+                        },
+                    };
+                    let _ = comms_client.response_channel.send(resp).await;
+                }
+                MessageBody::Read { msg_id } => {
+                    let resp = Message {
+                        dest: msg.src,
+                        src: my_id.clone(),
+                        body: MessageBody::ReadOk {
+                            in_reply_to: msg_id,
+                            messages: gossiper.get_gossip(0)
+                        },
+                    };
+                    let _ = comms_client.response_channel.send(resp).await;
+                }
+                _ => panic!("Unknown message type"),
             }
-            MessageBody::Read { msg_id } => {
-                let resp = Message {
-                    dest: msg.src,
-                    src: my_id.clone(),
-                    body: MessageBody::ReadOk {
-                        in_reply_to: msg_id,
-                        messages: messages.clone(),
-                    },
-                };
-                let _ = comms_client.response_channel.send(resp).await;
-            }
-            _ => panic!("Unknown message type"),
         }
     }
 }
@@ -187,10 +269,12 @@ enum MessageBody {
     },
     ReadOk {
         in_reply_to: u32,
-        messages: HashSet<u32>,
+        messages: Vec<u32>,
     },
     Gossip {
-        message: u32,
+        messages: Vec<u32>,
+        node_seq_id: usize,
+        last_neighbour_seq_id: usize,
     },
     Broadcast {
         msg_id: u32,
