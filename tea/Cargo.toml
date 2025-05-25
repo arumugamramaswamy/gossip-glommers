@@ -1,2 +1,2 @@
 [workspace]
-members = ["echo","generate","broadcast"]
+members = ["echo","generate","broadcast","gcounter"]
