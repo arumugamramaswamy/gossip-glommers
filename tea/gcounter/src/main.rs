@@ -3,8 +3,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json;
-use tokio::io::{self, AsyncBufReadExt, BufReader, Lines, Stdin};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncBufReadExt, BufReader, Stdin};
 use tokio::time::interval;
 
 #[tokio::main]
@@ -30,17 +29,17 @@ async fn main() {
 struct GCounterState {
     remaining: u32,
     current_state: u32,
-    node_name: String,
+    sender: Sender,
     request_id_to_delta: HashMap<u32, u32>,
     message_id: u32,
 }
 
 impl GCounterState {
-    fn new(my_id: String) -> Self {
+    fn new(sender: Sender) -> Self {
         Self {
             remaining: 0,
             current_state: 0,
-            node_name: my_id,
+            sender,
             request_id_to_delta: HashMap::new(),
             message_id: 0,
         }
@@ -54,32 +53,32 @@ impl GCounterState {
 
         self.request_id_to_delta.insert(msg_id, self.remaining);
 
-        send(
-            "seq-kv".to_string(),
-            self.node_name.clone(),
-            MessageBody::Cas {
-                msg_id,
-                key: "k".to_string(),
-                from: self.current_state,
-                to: self.current_state + self.remaining,
-                create_if_not_exists: true,
-            },
-        )
-        .await;
+        self.sender
+            .send(
+                "seq-kv".to_string(),
+                MessageBody::Cas {
+                    msg_id,
+                    key: "k".to_string(),
+                    from: self.current_state,
+                    to: self.current_state + self.remaining,
+                    create_if_not_exists: true,
+                },
+            )
+            .await;
     }
 
     async fn handle_message(&mut self, msg: Message) {
         match msg.body {
             MessageBody::Read { msg_id, .. } => {
-                send(
-                    msg.src,
-                    self.node_name.clone(),
-                    MessageBody::ReadOk {
-                        in_reply_to: msg_id,
-                        value: self.current_state,
-                    },
-                )
-                .await
+                self.sender
+                    .send(
+                        msg.src,
+                        MessageBody::ReadOk {
+                            in_reply_to: msg_id,
+                            value: self.current_state,
+                        },
+                    )
+                    .await
             }
             MessageBody::ReadOk { value, .. } => {
                 if value > self.current_state {
@@ -88,14 +87,14 @@ impl GCounterState {
             }
             MessageBody::Add { delta, msg_id } => {
                 self.remaining += delta;
-                send(
-                    msg.src,
-                    self.node_name.clone(),
-                    MessageBody::AddOk {
-                        in_reply_to: msg_id,
-                    },
-                )
-                .await;
+                self.sender
+                    .send(
+                        msg.src,
+                        MessageBody::AddOk {
+                            in_reply_to: msg_id,
+                        },
+                    )
+                    .await;
             }
             MessageBody::CasOk { in_reply_to } => {
                 self.remaining -= self.request_id_to_delta.remove(&in_reply_to).unwrap();
@@ -106,36 +105,37 @@ impl GCounterState {
                     self.message_id
                 };
                 self.request_id_to_delta.remove(&in_reply_to).unwrap();
-                send(
-                    "seq-kv".to_string(),
-                    self.node_name.clone(),
-                    MessageBody::Read {
-                        msg_id,
-                        key: Some("k".to_string()),
-                    },
-                )
-                .await
+                self.sender
+                    .send(
+                        "seq-kv".to_string(),
+                        MessageBody::Read {
+                            msg_id,
+                            key: Some("k".to_string()),
+                        },
+                    )
+                    .await
             }
             _ => unreachable!(),
         }
     }
 }
 
-async fn perform_init(receiver: &mut Receiver) -> String {
+async fn perform_init(receiver: &mut Receiver) -> Sender {
     let msg = receiver.recv().await;
     match msg.body {
         MessageBody::Init {
             msg_id, node_id, ..
         } => {
-            let _ = send(
-                msg.src,
-                node_id.clone(),
-                MessageBody::InitOk {
-                    in_reply_to: msg_id,
-                },
-            )
-            .await;
-            node_id
+            let sender = Sender(node_id);
+            let _ = sender
+                .send(
+                    msg.src,
+                    MessageBody::InitOk {
+                        in_reply_to: msg_id,
+                    },
+                )
+                .await;
+            sender
         }
         _ => panic!("init message expected"),
     }
@@ -156,10 +156,18 @@ impl Receiver {
     }
 }
 
-async fn send(dest: String, src: String, body: MessageBody) {
-    let msg = Message { dest, src, body };
-    eprintln!("Sending Message: {msg:?}");
-    println!("{}", serde_json::to_string(&msg).unwrap());
+struct Sender(String);
+
+impl Sender {
+    async fn send(&self, dest: String, body: MessageBody) {
+        let msg = Message {
+            dest,
+            src: self.0.clone(),
+            body,
+        };
+        eprintln!("Sending Message: {msg:?}");
+        println!("{}", serde_json::to_string(&msg).unwrap());
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
